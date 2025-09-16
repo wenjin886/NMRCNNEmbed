@@ -16,7 +16,8 @@ from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, EarlyStopping
 
 from dataset_dataloader import prep_ir_geo_dataset, qm9_dataset_collate_fn, qm9_dataset_info
-from nmr_cnn_encoder import NMR_CNN_Encoder_PeakPrediction
+from nmr_cnn_encoder import NMRPeakPredictionModel
+
 
 def get_formatted_exp_name(exp_name, resume=False):
     formatted_time = datetime.now().strftime("%H-%M-%d-%m-%Y")
@@ -40,6 +41,7 @@ def main(args):
     if args.code_test:
         dataloader = DataLoader(dataset_dic['val'], batch_size=args.batch_size, collate_fn=qm9_dataset_collate_fn,
                                 shuffle=False, num_workers=17)
+        save_dirpath = args.exp_save_path
     else:
         train_dataloader = DataLoader(dataset_dic['train'], batch_size=args.batch_size, collate_fn=qm9_dataset_collate_fn,
                                 shuffle=True, num_workers=17)
@@ -55,12 +57,13 @@ def main(args):
             print(f"Making dir: {save_dirpath}")
             os.makedirs(save_dirpath)
     
-    model = NMR_CNN_Encoder_PeakPrediction(enc_output_dim=512, 
-                                             max_num_peaks=qm9_dataset_info['max_num_peaks_H'],
-                                             one_hot_dim=qm9_dataset_info['max_num_atoms_peak_H']+1, 
-                                             ppm_min=-5, ppm_max=20,
-                                             lr=args.lr, warm_up_step=args.warm_up_step,
-                                             device=device, dtype=dtype)
+    model = NMRPeakPredictionModel(enc_output_dim=512, 
+                                       spec_len=args.spec_len, patch_len=args.patch_len,
+                                       max_num_peaks=qm9_dataset_info['max_num_peaks_H'],
+                                       one_hot_dim=qm9_dataset_info['max_num_atoms_peak_H']+1, 
+                                       ppm_min=-5, ppm_max=20,
+                                       lr=args.lr, warm_up_step=args.warm_up_step,
+                                       device=device, dtype=dtype)
     model.to(device)  
 
     
@@ -147,6 +150,8 @@ if __name__ == "__main__":
     parser.add_argument('--resume', action='store_true')
     parser.add_argument('--checkpoint_path', type=str)
 
+    parser.add_argument('--spec_len', type=int, default=1600)
+    parser.add_argument('--patch_len', type=int, default=16)
 
     parser.add_argument('--code_test', action='store_true')
     parser.add_argument('--warm_up_step', type=int, default=3000)
