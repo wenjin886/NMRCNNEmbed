@@ -115,6 +115,18 @@ class NMRDataset(Dataset):
             else:
                 data_i_[key] = torch.from_numpy(value)
         
+        # print('origin x_grouped_H', data_i_["x_grouped_H"])
+        # print('origin y_grouped_H', data_i_["y_grouped_H"])
+        sorted_x_H, idx_H = torch.sort(data_i_["x_grouped_H"])
+        data_i_["x_grouped_H"] = sorted_x_H
+        data_i_["y_grouped_H"] = data_i_["y_grouped_H"][idx_H]
+        # print('sorted x_grouped_H', data_i_["x_grouped_H"])
+        # print('sorted y_grouped_H', data_i_["y_grouped_H"])
+        
+        sorted_x_C, idx_C = torch.sort(data_i_["x_grouped_C"])
+        data_i_["x_grouped_C"] = sorted_x_C
+        data_i_["y_grouped_C"] = data_i_["y_grouped_C"][idx_C]
+        
         return data_i_
 
 
@@ -128,31 +140,19 @@ def dataset_collate_fn(data, dataset):
 
     num_peaks_H = torch.tensor([data_i["num_peaks_H"] for data_i in data])
     num_peaks_C = torch.tensor([data_i["num_peaks_C"] for data_i in data])
-    # max_num_peaks_H = max(num_peaks_H)
-    # max_num_peaks_C = max(num_peaks_C)
-    
 
     
     if dataset == 'qm9':
         dataset_info = qm9_dataset_info
 
     ignore_index = -100
-    x_grouped_H = torch.full((batch_size, dataset_info['max_num_peaks_H']), fill_value=ignore_index)
-    x_grouped_C = torch.full((batch_size, dataset_info['max_num_peaks_C']), fill_value=ignore_index)
+    x_grouped_H = torch.full((batch_size, dataset_info['max_num_peaks_H']), fill_value=ignore_index).float()
+    x_grouped_C = torch.full((batch_size, dataset_info['max_num_peaks_C']), fill_value=ignore_index).float()
     y_grouped_H = torch.full((batch_size, dataset_info['max_num_peaks_H']), fill_value=ignore_index).long()
     y_grouped_C = torch.full((batch_size, dataset_info['max_num_peaks_C']), fill_value=ignore_index).long()
-    
-    # peak_H_one_hot = torch.zeros(batch_size, dataset_info['max_num_peaks_H'], dataset_info['max_num_atoms_peak_H']+1) # num_peak may equal to 0
-    # peak_C_one_hot = torch.zeros(batch_size, dataset_info['max_num_peaks_C'], dataset_info['max_num_atoms_peak_C']+1)
-    
-    # peak_H_one_hot = torch.full((batch_size, dataset_info['max_num_peaks_H'], dataset_info['max_num_atoms_peak_H']+1), 
-    #                              fill_value=ignore_index, dtype=torch.long)
-    # peak_C_one_hot = torch.full((batch_size, dataset_info['max_num_peaks_C'], dataset_info['max_num_atoms_peak_C']+1), 
-    #                              fill_value=ignore_index, dtype=torch.long)
-    
+  
     for i in range(batch_size):
-        # peak_H_one_hot[i, :num_peaks_H[i], :] = F.one_hot(data[i]["y_grouped_H"], dataset_info['max_num_atoms_peak_H']+1)
-        # peak_C_one_hot[i, :num_peaks_C[i], :] = F.one_hot(data[i]["y_grouped_C"], dataset_info['max_num_atoms_peak_C']+1)
+       
         x_grouped_H[i, :num_peaks_H[i]] = data[i]["x_grouped_H"]
         x_grouped_C[i, :num_peaks_C[i]] = data[i]["x_grouped_C"]
 
@@ -162,10 +162,6 @@ def dataset_collate_fn(data, dataset):
     nmr_h = torch.stack([data_i["y_H"] for data_i in data])
     nmr_c = torch.stack([data_i["y_C"] for data_i in data])
     
-
-    
-
-   
 
     return {
         "id": [data_i["id"] for data_i in data],
