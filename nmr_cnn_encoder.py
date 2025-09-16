@@ -6,6 +6,17 @@ import torch.nn.functional as F
 
 import pytorch_lightning as pl
 
+import copy
+
+from spec_utils import (
+    Embeddings,
+    PositionalEncoding,
+    MultiHeadedAttention,
+    PositionwiseFeedForward,
+    Encoder, EncoderLayer,
+    Decoder, DecoderLayer,
+)
+
 class NMR_CNN_Encoder(nn.Module):
     def __init__(self, output_dim, kernel_size, dropout_rate=0.1):
         super(NMR_CNN_Encoder, self).__init__()
@@ -46,8 +57,8 @@ class NMR_CNN_Encoder(nn.Module):
         )
     
     def forward(self, x):
-        # 假设输入 x 维度: (batch, 1, seq_len)
-        x = self.conv_block1(x)
+        # 输入 x 维度: (batch, seq_len)
+        x = self.conv_block1(x.unsqueeze(1))
         x = self.max_pool(x) # 降采样
         x = self.conv_block2(x)
         x = self.max_pool(x) # 再次降采样
@@ -61,6 +72,94 @@ class NMR_CNN_Encoder(nn.Module):
         
         return output
 
+class NMREmbedPatchAttention(nn.Module):
+    def __init__(self, spec_len=3200, patch_len=8, d_model=256, h=8) -> None:
+        super(NMREmbedPatchAttention, self).__init__()
+        assert spec_len%patch_len == 0, "Patch length {} doesn't match spectra length {}".format(patch_len, spec_len)
+        self.patch_len = patch_len
+        self.d_model = d_model
+        self.embed = nn.Sequential(
+            nn.Linear(1, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, d_model)
+        )
+        self.patch = nn.Linear(patch_len*d_model, d_model)
+        self.attention = MultiHeadedAttention(h=h, d_model=d_model)
+        # self.attention = nn.MultiheadAttention(embed_dim=d_model, num_heads=h, batch_first=True)
+        
+    def forward(self, spec): #[batch_size, spec_len]
+        batch_size = spec.shape[0]
+
+        # print("spec", spec.unsqueeze(2).shape)
+        spec = self.embed(spec.unsqueeze(2)) #[batch_size, spec_len, d_model]
+        # print("spec", spec.shape)
+
+        spec = spec.view(batch_size, -1, self.patch_len, self.d_model) #[batch_size, spec_len/patch_size, patch_size, d_model]
+        spec = spec.view(-1, self.patch_len, self.d_model) #[batch_size*(spec_len/patch_size), patch_size, d_model]
+        spec = self.attention(spec, spec, spec)
+ 
+        spec = spec.view(batch_size, -1, self.patch_len, self.d_model) #[batch_size, spec_len/patch_size, patch_size, d_model]
+        spec = spec.reshape(batch_size, spec.shape[1], -1) #[batch_size, spec_len/patch_size, patch_size*d_model]
+        
+        return self.patch(spec) #[batch_size, spec_len/patch_size, d_model]
+
+class NMR_Attn_Encoder(nn.Module):
+    def __init__(self, 
+                 spec_len=1600, patch_len=16,
+                 d_model=512,
+                 n_spec_attention_head=8,
+                 n_spec_f_encoder_head=8,
+                 n_spec_f_encoder_layer=4,
+                 device=torch.device("cuda")
+                 ):
+        super().__init__()
+        self.d_model = d_model
+        self.spec_patch_num = int(spec_len/patch_len)
+        
+        c = copy.deepcopy
+        pe = PositionalEncoding(d_model, dropout=0.1)
+        spec_patch_att = NMREmbedPatchAttention(spec_len=spec_len, 
+                                              patch_len=patch_len, 
+                                              d_model=d_model,
+                                              h=n_spec_attention_head)
+        
+        # Encoder part
+        self.spec_embed = nn.Sequential(spec_patch_att, c(pe))
+     
+        encoder_attn = MultiHeadedAttention(h=n_spec_f_encoder_head,d_model=d_model)
+        ff = PositionwiseFeedForward(d_model=d_model, d_ff=2048, dropout=0.1)
+        self.spec_atom_encoder = Encoder(EncoderLayer(d_model, c(encoder_attn),c(ff),0.1), 
+                                         N=n_spec_f_encoder_layer)
+        
+        self.proj = nn.Sequential(
+            nn.Linear(self.spec_patch_num * d_model, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, d_model)
+        )
+
+        self.device_ = device
+        self.__init_weights__()
+    
+    def __init_weights__(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Embedding):
+                nn.init.xavier_normal_(m.weight)
+    
+    def forward(self, spectra):
+        B = spectra.shape[0]
+
+        src = self.spec_embed(spectra)
+        src_mask = torch.ones(spectra.shape[0], self.spec_patch_num, dtype=torch.bool).unsqueeze(-2).to(self.device_) # (B, 1, S)
+
+        src = self.spec_atom_encoder(src, src_mask) # (B, S/P, D)
+        # src = self.proj(src.view(B, -1)) # (B, S/P * D) --> # (B, D)
+            
+        return src, src_mask
+    
 class PeakPredictionHead(nn.Module):
     def __init__(self, input_dim, max_num_peaks, num_atom_types, 
                  ppm_min, ppm_max):
@@ -69,6 +168,7 @@ class PeakPredictionHead(nn.Module):
         self.peak_pos_pred = nn.Sequential(
             nn.Linear(512, 512),
             nn.ReLU(),
+            nn.Dropout(0.1),
             nn.Linear(512, max_num_peaks)
         )
         
@@ -76,6 +176,7 @@ class PeakPredictionHead(nn.Module):
         self.num_atoms_pred = nn.Sequential(
             nn.Linear(512, 512),
             nn.ReLU(),
+            nn.Dropout(0.1),
             nn.Linear(512, max_num_peaks*num_atom_types)
         )
 
@@ -146,38 +247,25 @@ class PeakPredictionHead(nn.Module):
         """
         # 1. 获取预测的类别索引
         # torch.argmax在最后一个维度(-1)上操作，得到每个峰最可能的类别
-        # print("num_atoms_true_indices")
-        # print(num_atoms_true_indices)
-        # print("num_atoms_pred_logits")
-        # print(num_atoms_pred_logits)
         pred_indices = torch.argmax(num_atoms_pred_logits, dim=-1) # -> (B, max_peaks)
-        # print("pred_indices")
-        # print(pred_indices)
-
         
         # 确保mask是布尔类型以便索引
         mask = torch.where(num_atoms_true_indices == ignore_idx, 0, 1)
         bool_mask = mask.bool()
-        # print("mask", mask)
         
         # 2. 筛选出真实峰的预测和标签
         # 只选择 mask 为 True 的位置上的元素
         masked_preds = pred_indices[bool_mask]
         masked_true = num_atoms_true_indices[bool_mask]
-
-        # print("masked_preds", masked_preds)
-        # print("masked_true", masked_true)
         
         # 3. 计算这些真实峰中，有多少预测是正确的
         correct_predictions = (masked_preds == masked_true).sum().item()
-        # print("correct_predictions", correct_predictions)
         
         # 4. 真实峰的总数
         total_real_peaks = mask.sum().item()
         
         # 5. 计算准确率
         accuracy = correct_predictions / total_real_peaks if total_real_peaks > 0 else 0.0
-        # print("accuracy", accuracy)
         
         return accuracy
 
@@ -191,21 +279,189 @@ class PeakPredictionHead(nn.Module):
 
         return ppm_pred_val, num_atoms_logits
 
-class NMR_CNN_Encoder_PeakPrediction(pl.LightningModule):
-    def __init__(self, enc_output_dim, max_num_peaks, one_hot_dim, ppm_min, ppm_max,
+class NMRPeakDecoder(nn.Module):
+    def __init__(self, d_model, 
+                 max_num_peaks, max_num_atoms_per_peak,
+                 ppm_min, ppm_max,
+                 n_decoder_head, decoder_dropout, n_decoder_layer,
+                 device):
+        super(NMRPeakDecoder, self).__init__()
+
+        self.peak_queries = nn.Parameter(torch.randn(max_num_peaks, d_model))
+        
+        c = copy.deepcopy
+        attn = MultiHeadedAttention(h=n_decoder_head, d_model=d_model, dropout=decoder_dropout)
+        ff = PositionwiseFeedForward(d_model=d_model, d_ff=2048, dropout=0.1)
+        self.decoder = Decoder(DecoderLayer(size=d_model, self_attn=c(attn), src_attn=c(attn), feed_forward=c(ff), dropout=0.1),
+                                      N=n_decoder_layer)
+
+        
+        self.peak_pos_pred = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.SiLU(),
+            nn.Dropout(0.1),
+            nn.Linear(d_model, 1)
+        )
+
+        # Classification part for num_atoms
+        self.cls_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.SiLU(),
+            nn.Dropout(0.1),
+            nn.Linear(d_model, max_num_atoms_per_peak)
+        )    
+       
+        self.max_num_peaks = max_num_peaks
+        self.max_num_atoms_per_peak = max_num_atoms_per_peak
+        self.ppm_min = ppm_min
+        self.ppm_max = ppm_max
+        self.device_ = device
+
+        self.__init_weights__()
+    
+    def __init_weights__(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Embedding):
+                nn.init.xavier_normal_(m.weight)
+    
+    def proj_pos_pred(self, pos_logits):
+        # 把预测从 [0,1] 映射回 ppm
+        
+        span = (self.ppm_max - self.ppm_min)
+        ppm_pred = self.ppm_min + pos_logits * span      # (B, m)
+        return ppm_pred
+    
+    def decode(self, enc_out, src_mask):
+        bs = enc_out.shape[0]
+        tgt_mask = torch.ones(bs, 1, self.peak_queries.shape[0], dtype=torch.bool).to(self.device_)
+        peak_queries_ = self.peak_queries.unsqueeze(0).repeat(bs, 1, 1)
+        peak_queries_ =  self.decoder(peak_queries_,
+                            memory=enc_out,
+                            src_mask=src_mask, 
+                            tgt_mask=tgt_mask
+                            )
+        return peak_queries_
+    
+    def forward(self, enc_out, src_mask):
+        
+        peak_queries = self.decode(enc_out, src_mask)
+
+        peak_pos_logits  = self.peak_pos_pred(peak_queries).squeeze().sigmoid()  # -> (B, max_num_peaks)
+        ppm_pred_val = self.proj_pos_pred(peak_pos_logits)
+        
+        num_atoms_logits = self.cls_head(peak_queries) # -> (B, max_peaks, max_num_atoms_per_peak)
+
+        return ppm_pred_val, num_atoms_logits
+
+
+    def loss_pos(self, ppm_pred_val, ppm_true, ignore_idx=-100):
+        # ppm_pred 和 ppm_true 的维度都是 (B, max_peaks)
+        # mask 的维度是 (B, max_peaks)
+        mask = torch.where(ppm_true == ignore_idx, 0, 1)
+        # 逐元素计算损失
+        loss = F.mse_loss(ppm_pred_val, ppm_true, reduction='none') # reduction='none' 保留每个元素的损失
+        
+        # 应用掩码，只保留真实峰的损失
+        masked_loss = loss * mask
+        
+        # 计算平均损失时，分母应该是真实峰的数量，而不是总元素数量
+        # 添加一个极小值防止 mask.sum() 为0
+        final_loss = masked_loss.sum() / (mask.sum() + 1e-8) 
+        
+        return final_loss
+    
+    def loss_num_atoms(self, num_atoms_pred_logits, num_atoms_true_indices, ignore_idx=-100):
+        """
+        使用交叉熵计算原子数量的损失。
+        
+        Args:
+            num_atoms_pred_logits (torch.Tensor): 模型的原始输出, 形状为 (B, max_peaks, num_classes)
+            num_atoms_true_indices (torch.Tensor): 真实的类别索引, 形状为 (B, max_peaks), long 类型
+            ignore_idx (int): 在真实标签中需要忽略的填充值
+        """
+        # 获取类别数量
+        B, max_p, num_classes = num_atoms_pred_logits.shape
+        
+        # 为了匹配 F.cross_entropy 的输入要求，我们需要重塑张量
+        # (B, max_peaks, num_classes) -> (B * max_peaks, num_classes)
+        pred_logits_flat = num_atoms_pred_logits.view(-1, num_classes)
+        
+        # (B, max_peaks) -> (B * max_peaks,)
+        true_indices_flat = num_atoms_true_indices.view(-1)
+        
+        # 计算损失，ignore_index 参数会自动处理我们之前用-100填充的假峰
+        loss = F.cross_entropy(pred_logits_flat, true_indices_flat, ignore_index=ignore_idx)
+        return loss
+    
+    def acc_num_atoms(self, num_atoms_pred_logits, num_atoms_true_indices, ignore_idx=-100):
+        """
+        在有padding的情况下，使用mask计算原子数量预测的准确率。
+
+        Args:
+            num_atoms_pred_logits (torch.Tensor): 模型输出, (B, max_peaks, num_classes)
+            num_atoms_true_indices (torch.Tensor): 真实标签, (B, max_peaks), long类型
+            mask (torch.Tensor): 掩码, (B, max_peaks), 真实峰为1, 填充为0
+
+        Returns:
+            float: 准确率 (0.0 to 1.0)
+        """
+        # 1. 获取预测的类别索引
+        # torch.argmax在最后一个维度(-1)上操作，得到每个峰最可能的类别
+        pred_indices = torch.argmax(num_atoms_pred_logits, dim=-1) # -> (B, max_peaks)
+        
+        # 确保mask是布尔类型以便索引
+        mask = torch.where(num_atoms_true_indices == ignore_idx, 0, 1)
+        bool_mask = mask.bool()
+        
+        # 2. 筛选出真实峰的预测和标签
+        # 只选择 mask 为 True 的位置上的元素
+        masked_preds = pred_indices[bool_mask]
+        masked_true = num_atoms_true_indices[bool_mask]
+        
+        # 3. 计算这些真实峰中，有多少预测是正确的
+        correct_predictions = (masked_preds == masked_true).sum().item()
+        
+        # 4. 真实峰的总数
+        total_real_peaks = mask.sum().item()
+        
+        # 5. 计算准确率
+        accuracy = correct_predictions / total_real_peaks if total_real_peaks > 0 else 0.0
+        
+        return accuracy
+
+class NMRPeakPredictionModel(pl.LightningModule):
+    def __init__(self, enc_output_dim, 
+                 spec_len, patch_len, # attn encoder
+                 max_num_peaks, one_hot_dim, ppm_min, ppm_max,
                  lr, warm_up_step,
                  device, dtype):
-        super(NMR_CNN_Encoder_PeakPrediction, self).__init__()
-        self.encoder = NMR_CNN_Encoder(output_dim=enc_output_dim, kernel_size=7)
-        self.peak_prediction_head = PeakPredictionHead(input_dim=enc_output_dim, 
-                                                       max_num_peaks=max_num_peaks,
-                                                       num_atom_types=one_hot_dim,
-                                                       ppm_min=ppm_min, ppm_max=ppm_max)
+        super(NMRPeakPredictionModel, self).__init__()
+        # self.encoder = NMR_CNN_Encoder(output_dim=enc_output_dim, kernel_size=7)
+        self.encoder = NMR_Attn_Encoder(spec_len, patch_len, d_model=enc_output_dim, device=device)
+
+        # self.peak_prediction_head = PeakPredictionHead(input_dim=enc_output_dim, 
+        #                                                max_num_peaks=max_num_peaks,
+        #                                                num_atom_types=one_hot_dim,
+        #                                                ppm_min=ppm_min, ppm_max=ppm_max)
+
+        self.peak_prediction_head = NMRPeakDecoder(d_model=enc_output_dim, max_num_peaks=max_num_peaks, 
+                                                   max_num_atoms_per_peak=one_hot_dim,
+                                                   ppm_min=ppm_min, ppm_max=ppm_max,
+                                                   n_decoder_head=8, decoder_dropout=0.1, n_decoder_layer=4,
+                                                   device=device)
+
         self.lr = lr
         self.warm_up_step = warm_up_step
         self.enc_output_dim = enc_output_dim
         self.device_ = device
         self.dtype_ = dtype
+
+        self.save_hyperparameters()
+
     def compute_loss(self, ppm_pred_val, num_atoms_logits, ppm_true, num_atoms_true):
 
         loss_pos = self.peak_prediction_head.loss_pos(ppm_pred_val, ppm_true)
@@ -214,16 +470,22 @@ class NMR_CNN_Encoder_PeakPrediction(pl.LightningModule):
         return loss, loss_pos, loss_num_atoms
 
     def forward(self, x, ppm_true, num_atoms_true):
-        x = self.encoder(x)
-        ppm_pred_val, num_atoms_logits = self.peak_prediction_head(x)
+        x, src_mask = self.encoder(x)
+        # print("enc_out", x.shape)
+        ppm_pred_val, num_atoms_logits = self.peak_prediction_head(x, src_mask)
         loss, loss_pos, loss_num_atoms = self.compute_loss(ppm_pred_val, num_atoms_logits, ppm_true, num_atoms_true)
 
         return x, ppm_pred_val, num_atoms_logits, loss, loss_pos, loss_num_atoms
     
     def step(self, batch, batch_idx):
-        nmr_h = batch['nmr_h'].unsqueeze(1).to(self.device_, dtype=self.dtype_) 
+        # nmr_h = batch['nmr_h'].unsqueeze(1).to(self.device_, dtype=self.dtype_) 
+        nmr_h = batch['nmr_h'].to(self.device_, dtype=self.dtype_) 
         ppm_true = batch['x_grouped_H'].to(self.device_, dtype=self.dtype_) 
+        # print("ppm_true")
+        # print(ppm_true)
         num_atoms_true = batch['y_grouped_H'].to(self.device_) 
+        # print("num_atoms_true")
+        # print(num_atoms_true)
         x, ppm_pred_val, num_atoms_logits, loss, loss_pos, loss_num_atoms = self(nmr_h, ppm_true, num_atoms_true)
         return  x, ppm_pred_val, num_atoms_logits, loss, loss_pos, loss_num_atoms
     
@@ -269,7 +531,8 @@ class NMR_CNN_Encoder_PeakPrediction(pl.LightningModule):
             self.parameters(),
             lr=self.lr,
             betas=(0.9, 0.998),
-            eps=1e-9
+            eps=1e-9,
+            weight_decay=1e-5 
         )
 
         def rate(step):
